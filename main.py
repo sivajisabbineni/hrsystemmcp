@@ -313,6 +313,12 @@ async def mcp_post_handler(request: Request):
                 from starlette.responses import Response
                 return Response(status_code=204)
             from starlette.responses import JSONResponse
+            if response_obj.get("error", {}).get("code") == -32001:
+                return JSONResponse(
+                    response_obj,
+                    status_code=401,
+                    headers={"WWW-Authenticate": f'Bearer resource_metadata="{_base_url(request)}/.well-known/oauth-protected-resource/mcp"'}
+                )
             return JSONResponse(response_obj)
 
         async def generate_ndjson():
@@ -354,9 +360,35 @@ async def mcp_get_handler(request: Request):
         headers={"Cache-Control": "no-cache", "Connection": "keep-alive"}
     )
 
+def _base_url(request: Request) -> str:
+    """Public base URL of this server (PUBLIC_BASE_URL overrides; else derived from the request, honoring proxy headers)."""
+    configured = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
+    if configured:
+        return configured
+    proto = request.headers.get("x-forwarded-proto", request.url.scheme).split(",")[0].strip()
+    host = request.headers.get("x-forwarded-host", request.headers.get("host", request.url.netloc)).split(",")[0].strip()
+    return f"{proto}://{host}"
+
+async def oauth_protected_resource_handler(request: Request):
+    """RFC 9728 protected resource metadata, pointing clients at the Okta authorization server."""
+    from starlette.responses import JSONResponse
+    okta_domain = os.getenv("OKTA_DOMAIN", "").strip()
+    auth_server_id = os.getenv("OKTA_AUTHORIZATION_SERVER_ID", "").strip()
+    metadata = {
+        "resource": f"{_base_url(request)}/mcp",
+        "authorization_servers": [f"https://{okta_domain}/oauth2/{auth_server_id}"],
+        "bearer_methods_supported": ["header"],
+    }
+    scopes = os.getenv("OKTA_REQUIRED_SCOPES", "").split()
+    if scopes:
+        metadata["scopes_supported"] = scopes
+    return JSONResponse(metadata)
+
 # Add MCP endpoints — POST for messages, GET for SSE stream
 app.routes.append(Route("/mcp", mcp_post_handler, methods=["POST"]))
 app.routes.append(Route("/mcp", mcp_get_handler, methods=["GET"]))
+app.routes.append(Route("/.well-known/oauth-protected-resource", oauth_protected_resource_handler, methods=["GET"]))
+app.routes.append(Route("/.well-known/oauth-protected-resource/mcp", oauth_protected_resource_handler, methods=["GET"]))
 
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "--http":
