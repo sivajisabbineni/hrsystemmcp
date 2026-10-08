@@ -178,193 +178,190 @@ def get_time_off_requests(employee_id: str = None) -> dict:
     }
 
 
+# ASGI app exposed at module level (required by Vercel and other ASGI hosts)
+import uvicorn
+from starlette.applications import Starlette
+from starlette.responses import StreamingResponse
+from starlette.routing import Route
+from starlette.requests import Request
+import json
+import asyncio
+from contextlib import asynccontextmanager
+
+
+# Create Starlette app
+app = Starlette()
+
+# We'll use the FastMCP server instance to handle messages
+# FastMCP needs proper async handling for the protocol
+
+async def handle_mcp_message(message, auth_header):
+    """Process a single MCP JSON-RPC message and return the response dict (or None for notifications)."""
+    if message.get("method") == "initialize":
+        print(f"[HR MCP DEBUG] Initialize request - no token validation needed")
+        return {
+            "jsonrpc": "2.0",
+            "id": message.get("id"),
+            "result": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "HR System MCP", "version": "1.0.0"}
+            }
+        }
+
+    elif message.get("method") == "tools/list":
+        if not PROTECTED_DISCOVERY and not auth_header:
+            print(f"[HR MCP DEBUG] tools/list without auth (PROTECTED_DISCOVERY=false): returning tool list")
+            return {
+                "jsonrpc": "2.0",
+                "id": message.get("id"),
+                "result": {"tools": HR_TOOLS_LIST}
+            }
+        print(f"[HR MCP DEBUG] tools/list - validating Okta token...")
+        token_claims = await validate_authorization_header(auth_header)
+        if not token_claims:
+            print(f"[HR MCP DEBUG] ❌ TOKEN VALIDATION FAILED")
+            return {
+                "jsonrpc": "2.0",
+                "id": message.get("id"),
+                "error": {"code": -32001, "message": "Unauthorized - Invalid or missing Okta token"}
+            }
+        print(f"[HR MCP DEBUG] ✅ TOKEN VALIDATED - sub: {token_claims.get('sub')}, aud: {token_claims.get('aud')}")
+        return {
+            "jsonrpc": "2.0",
+            "id": message.get("id"),
+            "result": {"tools": HR_TOOLS_LIST}
+        }
+
+    elif message.get("method") == "tools/call":
+        print(f"[HR MCP DEBUG] tools/call - validating Okta token...")
+        token_claims = await validate_authorization_header(auth_header)
+        if not token_claims:
+            print(f"[HR MCP DEBUG] ❌ TOKEN VALIDATION FAILED")
+            return {
+                "jsonrpc": "2.0",
+                "id": message.get("id"),
+                "error": {"code": -32001, "message": "Unauthorized - Invalid or missing Okta token"}
+            }
+        print(f"[HR MCP DEBUG] ✅ TOKEN VALIDATED - sub: {token_claims.get('sub')}, aud: {token_claims.get('aud')}")
+
+        tool_name = message.get("params", {}).get("name")
+        tool_args = message.get("params", {}).get("arguments", {})
+        try:
+            if tool_name == "get_employee":
+                result = get_employee(tool_args.get("employee_id"))
+            elif tool_name == "list_employees":
+                result = list_employees()
+            elif tool_name == "get_employee_payroll":
+                result = get_employee_payroll(tool_args.get("employee_id"))
+            elif tool_name == "request_time_off":
+                result = request_time_off(tool_args.get("employee_id"), tool_args.get("time_off_type"), tool_args.get("start_date"), tool_args.get("end_date"))
+            elif tool_name == "get_time_off_requests":
+                result = get_time_off_requests(tool_args.get("employee_id"))
+            else:
+                result = {"success": False, "error": f"Unknown tool: {tool_name}"}
+            return {
+                "jsonrpc": "2.0",
+                "id": message.get("id"),
+                "result": {"content": [{"type": "text", "text": json.dumps(result)}]}
+            }
+        except Exception as e:
+            return {
+                "jsonrpc": "2.0",
+                "id": message.get("id"),
+                "error": {"code": -32603, "message": f"Error calling tool: {str(e)}"}
+            }
+
+    elif message.get("method") == "notifications/initialized":
+        return None
+
+    else:
+        return {
+            "jsonrpc": "2.0",
+            "id": message.get("id"),
+            "error": {"code": -32601, "message": f"Method not found: {message.get('method')}"}
+        }
+
+async def mcp_post_handler(request: Request):
+    """
+    POST /mcp — handle MCP JSON-RPC requests.
+    Responds with application/json for single messages (Gateway compatible)
+    or application/x-ndjson for batches.
+    """
+    try:
+        auth_header = request.headers.get("Authorization")
+        session_id = request.headers.get("Mcp-Session-Id")
+
+        body = await request.body()
+        request_text = body.decode()
+
+        print(f"\n[HR MCP DEBUG] ===== INCOMING REQUEST =====")
+        print(f"[HR MCP DEBUG] Session ID: {session_id}")
+        print(f"[HR MCP DEBUG] Authorization header: {'Present' if auth_header else 'Missing'}")
+        print(f"[HR MCP DEBUG] Request body: {request_text[:150]}")
+
+        if not request_text.strip():
+            from starlette.responses import JSONResponse
+            return JSONResponse({"jsonrpc": "2.0", "error": {"code": -32700, "message": "Empty request"}}, status_code=400)
+
+        lines = [l for l in request_text.strip().split('\n') if l.strip()]
+
+        if len(lines) == 1:
+            message = json.loads(lines[0])
+            response_obj = await handle_mcp_message(message, auth_header)
+            if response_obj is None:
+                from starlette.responses import Response
+                return Response(status_code=204)
+            from starlette.responses import JSONResponse
+            return JSONResponse(response_obj)
+
+        async def generate_ndjson():
+            for line in lines:
+                message = json.loads(line)
+                response_obj = await handle_mcp_message(message, auth_header)
+                if response_obj is not None:
+                    yield json.dumps(response_obj).encode() + b'\n'
+
+        return StreamingResponse(
+            generate_ndjson(),
+            media_type="application/x-ndjson",
+            headers={"Cache-Control": "no-cache"}
+        )
+
+    except Exception as e:
+        from starlette.responses import JSONResponse
+        return JSONResponse(
+            {"jsonrpc": "2.0", "error": {"code": -32603, "message": str(e)}},
+            status_code=500
+        )
+
+async def mcp_get_handler(request: Request):
+    """
+    GET /mcp — SSE endpoint for server-initiated notifications.
+    The AgentCore Gateway opens this after initialize to listen for events.
+    """
+    print(f"[HR MCP DEBUG] GET /mcp — SSE stream opened")
+
+    async def event_stream():
+        # Keep connection alive; no server-initiated events in this simple server
+        while True:
+            yield f": keepalive\n\n".encode()
+            await asyncio.sleep(30)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"}
+    )
+
+# Add MCP endpoints — POST for messages, GET for SSE stream
+app.routes.append(Route("/mcp", mcp_post_handler, methods=["POST"]))
+app.routes.append(Route("/mcp", mcp_get_handler, methods=["GET"]))
+
 if __name__ == "__main__":
-    import sys
-    
     if len(sys.argv) > 1 and sys.argv[1] == "--http":
         port = int(sys.argv[2]) if len(sys.argv) > 2 else 8001
-        
-        import uvicorn
-        from starlette.applications import Starlette
-        from starlette.responses import StreamingResponse
-        from starlette.routing import Route
-        from starlette.requests import Request
-        import json
-        import asyncio
-        from contextlib import asynccontextmanager
-        
         print(f"Starting HR System MCP server on http://localhost:{port}/mcp (PROTECTED_DISCOVERY={PROTECTED_DISCOVERY})")
-        
-        # Create Starlette app
-        app = Starlette()
-        
-        # We'll use the FastMCP server instance to handle messages
-        # FastMCP needs proper async handling for the protocol
-        
-        async def handle_mcp_message(message, auth_header):
-            """Process a single MCP JSON-RPC message and return the response dict (or None for notifications)."""
-            if message.get("method") == "initialize":
-                print(f"[HR MCP DEBUG] Initialize request - no token validation needed")
-                return {
-                    "jsonrpc": "2.0",
-                    "id": message.get("id"),
-                    "result": {
-                        "protocolVersion": "2025-06-18",
-                        "capabilities": {"tools": {}},
-                        "serverInfo": {"name": "HR System MCP", "version": "1.0.0"}
-                    }
-                }
-
-            elif message.get("method") == "tools/list":
-                if not PROTECTED_DISCOVERY and not auth_header:
-                    print(f"[HR MCP DEBUG] tools/list without auth (PROTECTED_DISCOVERY=false): returning tool list")
-                    return {
-                        "jsonrpc": "2.0",
-                        "id": message.get("id"),
-                        "result": {"tools": HR_TOOLS_LIST}
-                    }
-                print(f"[HR MCP DEBUG] tools/list - validating Okta token...")
-                token_claims = await validate_authorization_header(auth_header)
-                if not token_claims:
-                    print(f"[HR MCP DEBUG] ❌ TOKEN VALIDATION FAILED")
-                    return {
-                        "jsonrpc": "2.0",
-                        "id": message.get("id"),
-                        "error": {"code": -32001, "message": "Unauthorized - Invalid or missing Okta token"}
-                    }
-                print(f"[HR MCP DEBUG] ✅ TOKEN VALIDATED - sub: {token_claims.get('sub')}, aud: {token_claims.get('aud')}")
-                return {
-                    "jsonrpc": "2.0",
-                    "id": message.get("id"),
-                    "result": {"tools": HR_TOOLS_LIST}
-                }
-
-            elif message.get("method") == "tools/call":
-                print(f"[HR MCP DEBUG] tools/call - validating Okta token...")
-                token_claims = await validate_authorization_header(auth_header)
-                if not token_claims:
-                    print(f"[HR MCP DEBUG] ❌ TOKEN VALIDATION FAILED")
-                    return {
-                        "jsonrpc": "2.0",
-                        "id": message.get("id"),
-                        "error": {"code": -32001, "message": "Unauthorized - Invalid or missing Okta token"}
-                    }
-                print(f"[HR MCP DEBUG] ✅ TOKEN VALIDATED - sub: {token_claims.get('sub')}, aud: {token_claims.get('aud')}")
-
-                tool_name = message.get("params", {}).get("name")
-                tool_args = message.get("params", {}).get("arguments", {})
-                try:
-                    if tool_name == "get_employee":
-                        result = get_employee(tool_args.get("employee_id"))
-                    elif tool_name == "list_employees":
-                        result = list_employees()
-                    elif tool_name == "get_employee_payroll":
-                        result = get_employee_payroll(tool_args.get("employee_id"))
-                    elif tool_name == "request_time_off":
-                        result = request_time_off(tool_args.get("employee_id"), tool_args.get("time_off_type"), tool_args.get("start_date"), tool_args.get("end_date"))
-                    elif tool_name == "get_time_off_requests":
-                        result = get_time_off_requests(tool_args.get("employee_id"))
-                    else:
-                        result = {"success": False, "error": f"Unknown tool: {tool_name}"}
-                    return {
-                        "jsonrpc": "2.0",
-                        "id": message.get("id"),
-                        "result": {"content": [{"type": "text", "text": json.dumps(result)}]}
-                    }
-                except Exception as e:
-                    return {
-                        "jsonrpc": "2.0",
-                        "id": message.get("id"),
-                        "error": {"code": -32603, "message": f"Error calling tool: {str(e)}"}
-                    }
-
-            elif message.get("method") == "notifications/initialized":
-                return None
-
-            else:
-                return {
-                    "jsonrpc": "2.0",
-                    "id": message.get("id"),
-                    "error": {"code": -32601, "message": f"Method not found: {message.get('method')}"}
-                }
-
-        async def mcp_post_handler(request: Request):
-            """
-            POST /mcp — handle MCP JSON-RPC requests.
-            Responds with application/json for single messages (Gateway compatible)
-            or application/x-ndjson for batches.
-            """
-            try:
-                auth_header = request.headers.get("Authorization")
-                session_id = request.headers.get("Mcp-Session-Id")
-
-                body = await request.body()
-                request_text = body.decode()
-
-                print(f"\n[HR MCP DEBUG] ===== INCOMING REQUEST =====")
-                print(f"[HR MCP DEBUG] Session ID: {session_id}")
-                print(f"[HR MCP DEBUG] Authorization header: {'Present' if auth_header else 'Missing'}")
-                print(f"[HR MCP DEBUG] Request body: {request_text[:150]}")
-
-                if not request_text.strip():
-                    from starlette.responses import JSONResponse
-                    return JSONResponse({"jsonrpc": "2.0", "error": {"code": -32700, "message": "Empty request"}}, status_code=400)
-
-                lines = [l for l in request_text.strip().split('\n') if l.strip()]
-
-                if len(lines) == 1:
-                    message = json.loads(lines[0])
-                    response_obj = await handle_mcp_message(message, auth_header)
-                    if response_obj is None:
-                        from starlette.responses import Response
-                        return Response(status_code=204)
-                    from starlette.responses import JSONResponse
-                    return JSONResponse(response_obj)
-
-                async def generate_ndjson():
-                    for line in lines:
-                        message = json.loads(line)
-                        response_obj = await handle_mcp_message(message, auth_header)
-                        if response_obj is not None:
-                            yield json.dumps(response_obj).encode() + b'\n'
-
-                return StreamingResponse(
-                    generate_ndjson(),
-                    media_type="application/x-ndjson",
-                    headers={"Cache-Control": "no-cache"}
-                )
-
-            except Exception as e:
-                from starlette.responses import JSONResponse
-                return JSONResponse(
-                    {"jsonrpc": "2.0", "error": {"code": -32603, "message": str(e)}},
-                    status_code=500
-                )
-
-        async def mcp_get_handler(request: Request):
-            """
-            GET /mcp — SSE endpoint for server-initiated notifications.
-            The AgentCore Gateway opens this after initialize to listen for events.
-            """
-            print(f"[HR MCP DEBUG] GET /mcp — SSE stream opened")
-
-            async def event_stream():
-                # Keep connection alive; no server-initiated events in this simple server
-                while True:
-                    yield f": keepalive\n\n".encode()
-                    await asyncio.sleep(30)
-
-            return StreamingResponse(
-                event_stream(),
-                media_type="text/event-stream",
-                headers={"Cache-Control": "no-cache", "Connection": "keep-alive"}
-            )
-
-        # Add MCP endpoints — POST for messages, GET for SSE stream
-        app.routes.append(Route("/mcp", mcp_post_handler, methods=["POST"]))
-        app.routes.append(Route("/mcp", mcp_get_handler, methods=["GET"]))
-        
-        # Run HTTP server
         uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
     else:
         # Default stdio mode
