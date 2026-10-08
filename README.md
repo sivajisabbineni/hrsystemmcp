@@ -37,8 +37,8 @@ python main.py --http 8001
 
 ### .env (Environment Variables)
 ```bash
-OKTA_DOMAIN=dev-12345.okta.com
-OKTA_AUTHORIZATION_SERVER_ID=auss2fth0mcIXHzVO1d7
+OKTA_DOMAIN=cisokta.oktapreview.com
+OKTA_AUTHORIZATION_SERVER_ID=aus14l35smtBYjDDC1d8
 OKTA_AUDIENCE=
 OKTA_REQUIRED_SCOPES=
 # When true (default), tools/list without auth returns 401. When false, allows unauthenticated tools/list (e.g. for gateway registration).
